@@ -1,3 +1,5 @@
+#include "parser.h"
+#include "threadlock.h"
 #include <stdint.h>
 #include <pthread.h>
 #include <stdio.h>
