@@ -3,8 +3,14 @@
 #include <stdint.h>
 #include <pthread.h>
 #include <stdio.h>
+#include "sys/time.h"
 
-
+long long current_timestamp() {
+  struct timeval te;
+  gettimeofday(&te, NULL); // get current time  
+  long long microseconds = (te.tv_sec * 1000000) + te.tv_usec; // calculate milliseconds  
+  return microseconds;  
+}
 
 typedef struct hash_struct
 {
@@ -17,7 +23,7 @@ typedef struct hash_struct
 //Organizes Hash records into an array, lets us track if one is locked/released
 typedef struct {
     hashRecord *head;
-    pthread_mutex_t lock;
+    pthread_rwlock_t rwlock;
 } hashBucket;
 
 //Hash Table Wrapper
@@ -36,7 +42,7 @@ concurrentHashTable* createHashTable(size_t num_buckets){
     for (int i = 0; i < num_buckets; i++)
     {
         table->buckets->head = NULL;
-        pthread_mutex_init(&table->buckets[i].lock, NULL);
+        pthread_mutex_init(&table->buckets[i].rwlock, NULL);
     }
 
     return table;
@@ -44,7 +50,7 @@ concurrentHashTable* createHashTable(size_t num_buckets){
 
 //These are template, you can change them to whateverr yoou think wroks best lol
 void readCommandsFile("commands.txt");
-void threadRelease(concurrentHashTable* table);
+void threadRelease(concurrentHashTable* table, uint32_t hash, int isWriter, int priority);
 void threadLock(concurrentHashTable* table);
 void hashInsert(concurrentHashTable* table, char* name, int salary, int priority);
 void hashDelete(concurrentHashTable * table, char* name,  int priority);
@@ -56,4 +62,19 @@ void writeLogFile();
 int main() {
 
   concurrentHashTable* table = createHashTable(100);
+}
+
+void threadRelease(concurrentHashTable* table, uint32_t hash, int isWriter, int priority){
+  if (!table) return;
+
+  size_t index = hash %table->num_buckets;
+
+  pthread_rwlock_unlock(&table->buckets[index].rwlock);
+
+  long long timestamp = current_timestamp();
+  if(isWriter) {
+    printf("%lld, THREAD %d WRITE LOCK RELEASED\n", timestamp, priority);
+  } else {
+    printf("%lld, THREAD %d READ LOCK RELEASED\n", timestamp, priority);
+  }
 }
