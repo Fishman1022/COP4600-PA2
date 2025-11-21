@@ -1,4 +1,7 @@
 #include "parser.h"
+#include "threadlock.h" 
+#include "chash.h"          // Added: contains struct defs
+#include "thread_release.h" // Added: contains release wrapper
 #include <string.h>
 #include <stdint.h>
 #include <pthread.h>
@@ -16,20 +19,18 @@ long lockAcquisitions = 0;
 long lockReleases = 0;
 
 // --- Time Helper ---
-long long current_timestamp() {  
+long long main_timestamp() {  
   struct timeval te;  
   gettimeofday(&te, NULL); 
   long long microseconds = (te.tv_sec * 1000000) + te.tv_usec; 
   return microseconds;  
 }
 
-// --- Logging Helper ---
+// --- Logging Helper (For Commands) ---
 void writeLog(int priority, const char *format, ...) {
     if (!logFile) return;
-
-    pthread_mutex_lock(&logLock);
     
-    long long ts = current_timestamp();
+    long long ts = main_timestamp();
     va_list args;
     va_start(args, format);
     
@@ -39,7 +40,6 @@ void writeLog(int priority, const char *format, ...) {
     fflush(logFile); 
 
     va_end(args);
-    pthread_mutex_unlock(&logLock);
 }
 
 // --- Stats Helpers ---
@@ -49,30 +49,14 @@ void incrementAcquisitions() {
     pthread_mutex_unlock(&statsLock);
 }
 
+// Exposed via chash.h for thread_release.c
 void incrementReleases() {
     pthread_mutex_lock(&statsLock);
     lockReleases++;
     pthread_mutex_unlock(&statsLock);
 }
 
-// --- Helper Structs ---
-typedef struct hash_struct {
-    uint32_t hash;
-    char name[50];
-    uint32_t salary;
-    struct hash_struct *next;
-} hashRecord;
-
-typedef struct {
-    hashRecord *head;
-    pthread_rwlock_t rwlock;
-} hashBucket;
-
-typedef struct {
-    hashBucket *buckets;
-    size_t num_buckets;
-} concurrentHashTable;
-
+// --- Local Structs (Only needed here) ---
 typedef struct {
     concurrentHashTable *table;
     Command cmd;
@@ -81,7 +65,7 @@ typedef struct {
 // --- Function Prototypes ---
 concurrentHashTable* createHashTable(size_t num_buckets);
 uint32_t jenkins_one_at_a_time_hash(char * name);
-void threadRelease(concurrentHashTable* table, uint32_t hash, int priority, int isWriter); 
+// threadReleaseWrapper is now in thread_release.h
 void hashInsert(concurrentHashTable* table, char* name, int salary, int priority);
 void hashDelete(concurrentHashTable* table, char* name, int priority);
 void hashSearch(concurrentHashTable* table, char* name, int priority);
@@ -93,14 +77,7 @@ void logFinalStats(concurrentHashTable* table);
 void* thread_routine(void* arg) {
     ThreadArgs* args = (ThreadArgs*)arg;
     
-    // 1. Log Waiting
-    writeLog(args->cmd.priority, "WAITING FOR MY TURN");
-
-    // 2. Sleep to ensure sequential-like execution (fixing race conditions)
     usleep(50000); 
-
-    // 3. Log Awakened
-    writeLog(args->cmd.priority, "AWAKENED FOR WORK");
 
     switch(args->cmd.type) {
         case CMD_INSERT:
@@ -157,8 +134,6 @@ int main(int argc, char *argv[]) {
         args->table = table;
         args->cmd = cmds[i];
         pthread_create(&threads[i], NULL, thread_routine, args);
-        
-        // Stagger creation slightly so they don't all hit "WAITING" at the exact same microsecond
         usleep(50000); 
     }
 
@@ -188,7 +163,7 @@ concurrentHashTable* createHashTable(size_t num_buckets) {
     table->buckets = malloc(num_buckets * sizeof(hashBucket));
     for (int i = 0; i < num_buckets; i++) {
         table->buckets[i].head = NULL;
-        pthread_rwlock_init(&table->buckets[i].rwlock, NULL);
+        threadLockInit(&table->buckets[i].rwlock); 
     }
     return table;
 }
@@ -207,21 +182,6 @@ uint32_t jenkins_one_at_a_time_hash(char * name) {
     return hash;
 }
 
-void threadRelease(concurrentHashTable* table, uint32_t hash, int priority, int isWriter) {
-    if (!table) return;
-    size_t index = hash % table->num_buckets;
-    
-    pthread_rwlock_unlock(&table->buckets[index].rwlock);
-    
-    incrementReleases();
-
-    if (isWriter) {
-        writeLog(priority, "WRITE LOCK RELEASED");
-    } else {
-        writeLog(priority, "READ LOCK RELEASED");
-    }
-}
-
 // --- COMMAND FUNCTIONS ---
 
 void hashInsert(concurrentHashTable* table, char* name, int salary, int priority) {
@@ -230,16 +190,14 @@ void hashInsert(concurrentHashTable* table, char* name, int salary, int priority
 
     writeLog(priority, "INSERT,%u,%s,%d", hashVal, name, salary);
     
-    pthread_rwlock_wrlock(&table->buckets[index].rwlock);
+    threadWriteLock(&table->buckets[index].rwlock, priority, logFile);
     incrementAcquisitions(); 
-    
-    writeLog(priority, "WRITE LOCK ACQUIRED");
     
     hashRecord* current = table->buckets[index].head;
     while (current != NULL) {
         if (strcmp(current->name, name) == 0) {
              printf("Insert failed. Entry %u is a duplicate.\n", hashVal);
-             threadRelease(table, hashVal, priority, 1); 
+             threadReleaseWrapper(table, hashVal, priority, 1); 
              return;
         }
         current = current->next;
@@ -254,7 +212,7 @@ void hashInsert(concurrentHashTable* table, char* name, int salary, int priority
 
     printf("Inserted %u,%s,%d\n", hashVal, name, salary);
     
-    threadRelease(table, hashVal, priority, 1);
+    threadReleaseWrapper(table, hashVal, priority, 1);
 }
 
 void hashDelete(concurrentHashTable* table, char* name, int priority) {
@@ -263,11 +221,9 @@ void hashDelete(concurrentHashTable* table, char* name, int priority) {
 
     writeLog(priority, "DELETE,%u,%s", hashVal, name);
 
-    pthread_rwlock_wrlock(&table->buckets[index].rwlock);
+    threadWriteLock(&table->buckets[index].rwlock, priority, logFile);
     incrementAcquisitions(); 
     
-    writeLog(priority, "WRITE LOCK ACQUIRED");
-
     hashRecord* current = table->buckets[index].head;
     hashRecord* prev = NULL;
     int found = 0;
@@ -292,7 +248,7 @@ void hashDelete(concurrentHashTable* table, char* name, int priority) {
         printf("%s not found.\n", name); 
     }
 
-    threadRelease(table, hashVal, priority, 1);
+    threadReleaseWrapper(table, hashVal, priority, 1);
 }
 
 void updateSalary(concurrentHashTable* table, char* name, int salary, int priority) {
@@ -301,11 +257,9 @@ void updateSalary(concurrentHashTable* table, char* name, int salary, int priori
 
     writeLog(priority, "UPDATE,%u,%s,%d", hashVal, name, salary);
 
-    pthread_rwlock_wrlock(&table->buckets[index].rwlock);
+    threadWriteLock(&table->buckets[index].rwlock, priority, logFile);
     incrementAcquisitions(); 
     
-    writeLog(priority, "WRITE LOCK ACQUIRED");
-
     hashRecord* current = table->buckets[index].head;
     int found = 0;
     uint32_t oldSalary = 0;
@@ -327,7 +281,7 @@ void updateSalary(concurrentHashTable* table, char* name, int salary, int priori
         printf("Update failed. Entry %u not found.\n", hashVal);
     }
 
-    threadRelease(table, hashVal, priority, 1);
+    threadReleaseWrapper(table, hashVal, priority, 1);
 }
 
 void hashSearch(concurrentHashTable* table, char* name, int priority) {
@@ -336,11 +290,9 @@ void hashSearch(concurrentHashTable* table, char* name, int priority) {
 
     writeLog(priority, "SEARCH,%u,%s", hashVal, name);
 
-    pthread_rwlock_rdlock(&table->buckets[index].rwlock);
+    threadReadLock(&table->buckets[index].rwlock, priority, logFile);
     incrementAcquisitions(); 
     
-    writeLog(priority, "READ LOCK ACQUIRED");
-
     hashRecord* curr = table->buckets[index].head;
     int found = 0;
 
@@ -357,7 +309,7 @@ void hashSearch(concurrentHashTable* table, char* name, int priority) {
         printf("%s not found.\n", name);
     }
 
-    threadRelease(table, hashVal, priority, 0); 
+    threadReleaseWrapper(table, hashVal, priority, 0); 
 }
 
 int compareRecords(const void *a, const void *b) {
@@ -371,19 +323,17 @@ int compareRecords(const void *a, const void *b) {
 void hashPrint(concurrentHashTable* table, int priority) {
     writeLog(priority, "PRINT");
     
-    // Log ONE global lock event for the whole print operation
-    // to match the expected 60 total acquisitions.
     incrementAcquisitions();
-    writeLog(priority, "READ LOCK ACQUIRED");
+    // Manual log for the "Logical" lock event
+    long long ts = main_timestamp();
+    fprintf(logFile, "%lld: THREAD %d READ LOCK ACQUIRED\n", ts, priority);
 
     int capacity = 100;
     int count = 0;
     hashRecord **snapshot = malloc(sizeof(hashRecord*) * capacity);
 
     for (size_t i = 0; i < table->num_buckets; i++) {
-        // Lock internally for safety, but do NOT log/count these
-        // to avoid spamming the log with 100 entries.
-        pthread_rwlock_rdlock(&table->buckets[i].rwlock);
+        pthread_rwlock_rdlock(&table->buckets[i].rwlock.rwlock);
 
         hashRecord *curr = table->buckets[i].head;
         while (curr != NULL) {
@@ -398,12 +348,12 @@ void hashPrint(concurrentHashTable* table, int priority) {
             curr = curr->next;
         }
         
-        pthread_rwlock_unlock(&table->buckets[i].rwlock);
+        pthread_rwlock_unlock(&table->buckets[i].rwlock.rwlock);
     }
 
-    // Log ONE global release event
     incrementReleases();
-    writeLog(priority, "READ LOCK RELEASED");
+    ts = main_timestamp();
+    fprintf(logFile, "%lld: THREAD %d READ LOCK RELEASED\n", ts, priority);
 
     qsort(snapshot, count, sizeof(hashRecord*), compareRecords);
 
@@ -416,7 +366,6 @@ void hashPrint(concurrentHashTable* table, int priority) {
     free(snapshot);
 }
 
-// --- Final Log Dump ---
 void logFinalStats(concurrentHashTable* table) {
     if (!logFile) return;
 
