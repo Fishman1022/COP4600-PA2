@@ -151,6 +151,9 @@ int main(int argc, char *argv[]) {
     if (logFile) fclose(logFile);
     pthread_mutex_destroy(&logLock);
     pthread_mutex_destroy(&statsLock);
+
+    // --- PAUSE HERE (Silent) ---
+    getchar();
     
     return 0;
 }
